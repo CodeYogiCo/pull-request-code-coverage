@@ -15,6 +15,7 @@ import (
 	"github.com/target/pull-request-code-coverage/internal/plugin/coverage/jacoco"
 	"github.com/target/pull-request-code-coverage/internal/plugin/coverage/lcov"
 	"github.com/target/pull-request-code-coverage/internal/plugin/coverage/pythoncov"
+	"github.com/target/pull-request-code-coverage/internal/plugin/domain"
 	"github.com/target/pull-request-code-coverage/internal/plugin/gitdiff"
 	"github.com/target/pull-request-code-coverage/internal/plugin/githubdiff"
 	"github.com/target/pull-request-code-coverage/internal/plugin/pluginhttp"
@@ -39,6 +40,19 @@ func NewRunner() *DefaultRunner {
 func (*DefaultRunner) Run(propertyGetter func(string) (string, bool), changedSourceLinesSource io.Reader, reportDefaultOut io.Writer) error {
 
 	logrus.Info("starting pull-request-code-coverage run")
+
+	// Master on/off switch. When PARAMETER_ENABLED is explicitly false the plugin
+	// does nothing and succeeds, so it can be left wired into a pipeline and
+	// toggled off without removing the step. Any other value (or unset) means enabled,
+	// preserving the original always-on behavior.
+	if enabledStr, enabledFound := propertyGetter("PARAMETER_ENABLED"); enabledFound {
+		if enabled, parseErr := strconv.ParseBool(strings.TrimSpace(enabledStr)); parseErr != nil {
+			logrus.Infof("PARAMETER_ENABLED value %q is not a valid bool, treating as enabled", enabledStr)
+		} else if !enabled {
+			logrus.Info("PARAMETER_ENABLED is false, skipping run")
+			return nil
+		}
+	}
 
 	rawSourceDirs, found := propertyGetter("PARAMETER_SOURCE_DIRS")
 	if !found {
@@ -202,7 +216,48 @@ func (*DefaultRunner) Run(propertyGetter func(string) (string, bool), changedSou
 		logrus.Info(eachOne.GetName())
 	}
 
-	return reporter.NewForking(reporters).Write(changedLinesWithCoverage)
+	if writeErr := reporter.NewForking(reporters).Write(changedLinesWithCoverage); writeErr != nil {
+		return writeErr
+	}
+
+	return enforceMinCoverage(propertyGetter, changedLinesWithCoverage)
+}
+
+// enforceMinCoverage fails the build when PARAMETER_MIN_COVERAGE is set and the
+// diff coverage falls below it. The report is always written first (so reviewers
+// still see the numbers); only the exit status changes. When the parameter is
+// absent or empty the gate is disabled and the run succeeds, preserving the
+// original report-only behavior.
+func enforceMinCoverage(propertyGetter func(string) (string, bool), report domain.SourceLineCoverageReport) error {
+	raw, found := propertyGetter("PARAMETER_MIN_COVERAGE")
+	if !found || strings.TrimSpace(raw) == "" {
+		logrus.Info("PARAMETER_MIN_COVERAGE was missing, coverage gate disabled")
+		return nil
+	}
+
+	minCoverage, parseErr := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if parseErr != nil {
+		return errors.Errorf("PARAMETER_MIN_COVERAGE value %q is not a valid number", raw)
+	}
+
+	covered := report.TotalCoveredInstructions()
+	missed := report.TotalMissedInstructions()
+	total := covered + missed
+
+	// A PR with no measurable changed lines counts as 100% and never fails.
+	if total == 0 {
+		logrus.Info("no measurable changed lines, coverage gate skipped")
+		return nil
+	}
+
+	actualPct := float64(covered) / float64(total) * 100
+
+	if actualPct < minCoverage {
+		return errors.Errorf("diff coverage %.0f%% is below the required minimum of %.0f%%", actualPct, minCoverage)
+	}
+
+	logrus.Infof("diff coverage %.0f%% meets the required minimum of %.0f%%", actualPct, minCoverage)
+	return nil
 }
 
 func parseSourceDirs(rawSourceDirStr string) []string {
